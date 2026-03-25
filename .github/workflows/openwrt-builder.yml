@@ -1,104 +1,162 @@
-name: FanchmWrt Builder
+
+
+#
+# https://github.com/P3TERX/Actions-OpenWrt
+#
+# File: .github/workflows/openwrt-bulder.yml
+# Description: Build OpenWrt using GitHub Actions
+#
+# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+
+name: OpenWrt Builder
+
 on:
+  repository_dispatch:
   workflow_dispatch:
 
 env:
-  # 强制启用Node.js 24，彻底解决废弃警告
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  # 官方FanchmWrt源码，锁定稳定分支
   REPO_URL: https://github.com/fanchmwrt/fanchmwrt
   REPO_BRANCH: fanchmwrt-24.10.4
+  FEEDS_CONF: feeds.conf.default
+  CONFIG_FILE: .config
+  DIY_P1_SH: diy-part1.sh
+  DIY_P2_SH: diy-part2.sh
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
 
 jobs:
   build:
     runs-on: ubuntu-22.04
-    steps:
-    - name: 检出仓库文件
-      uses: actions/checkout@v4
 
-    - name: 1. 安装编译依赖（官方稳定源，无权限操作）
+    steps:
+    - name: Checkout
+      uses: actions/checkout@main
+
+    - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        set -euo pipefail
+        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        sudo docker image prune --all --force
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install --no-install-recommends \
-          build-essential clang flex gawk gcc g++ git gettext \
-          libncurses5-dev libssl-dev python3-distutils rsync \
-          unzip zlib1g-dev file wget curl ca-certificates
+        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
-        echo "✅ 依赖安装完成"
+        sudo mkdir -p /workdir
+        sudo chown $USER:$GROUPS /workdir
 
-    - name: 2. 拉取FanchmWrt官方源码（带校验）
+    - name: Clone source code
+      working-directory: /workdir
       run: |
-        set -euo pipefail
-        git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
-        cd openwrt && git status
-        echo "✅ 源码拉取完成，分支：$REPO_BRANCH"
+        df -hT $PWD
+        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-    - name: 3. 添加自定义插件源（带容错）
+    - name: Load custom feeds
       run: |
-        set -euo pipefail
-        chmod +x "$GITHUB_WORKSPACE/diy-part1.sh"
+        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
+        chmod +x $DIY_P1_SH
         cd openwrt
-        # 先备份原feeds配置
-        cp feeds.conf.default feeds.conf.default.bak
-        # 执行自定义插件源添加
-        "$GITHUB_WORKSPACE/diy-part1.sh"
-        echo "✅ 插件源添加完成"
-        cat feeds.conf.default
+        $GITHUB_WORKSPACE/$DIY_P1_SH
 
-    - name: 4. 更新并安装插件（带重试）
-      run: |
-        set -euo pipefail
-        cd openwrt
-        # 重试机制，避免网络波动失败
-        ./scripts/feeds update -a || ./scripts/feeds update -a
-        ./scripts/feeds install -a || ./scripts/feeds install -a
-        echo "✅ 插件安装完成"
+    - name: Update feeds
+      run: cd openwrt && ./scripts/feeds update -a
 
-    - name: 5. 加载设备配置与自定义修改（带严格校验）
+    - name: Install feeds
+      run: cd openwrt && ./scripts/feeds install -a
+
+    - name: Load custom configuration
       run: |
-        set -euo pipefail
-        chmod +x "$GITHUB_WORKSPACE/diy-part2.sh"
+        [ -e files ] && mv files openwrt/files
+        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        chmod +x $DIY_P2_SH
         cd openwrt
-        # 校验配置文件存在
-        if [ -f "$GITHUB_WORKSPACE/.config" ]; then
-          cp "$GITHUB_WORKSPACE/.config" .config
-          echo "✅ 配置文件加载完成"
-        else
-          echo "❌ 错误：.config文件不存在！"
-          exit 1
-        fi
-        # 执行自定义修改
-        "$GITHUB_WORKSPACE/diy-part2.sh"
-        # 校验配置合法性
+        $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Download package
+      id: package
+      run: |
+        cd openwrt
         make defconfig
-        echo "✅ 配置校验通过"
+        make download -j8
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
-    - name: 6. 下载编译依赖包（带重试）
-      run: |
-        set -euo pipefail
-        cd openwrt
-        make download -j8 || make download -j4
-        echo "✅ 依赖包下载完成"
-
-    - name: 7. 编译固件（单线程稳定编译，带完整日志）
+    - name: Compile the firmware
       id: compile
       run: |
-        set -euo pipefail
         cd openwrt
-        echo "开始编译固件，单线程稳定模式"
-        make -j1 V=s
+        echo -e "$(nproc) thread compile"
+        make -j$(nproc) || make -j1 || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
-        echo "✅ 固件编译完成！"
+        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
+        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-    - name: 8. 输出固件
-      uses: actions/upload-artifact@v4
-      if: steps.compile.outputs.status == 'success'
+    - name: Check space usage
+      if: (!cancelled())
+      run: df -hT
+
+    - name: Upload bin directory
+      uses: actions/upload-artifact@main
+      if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
-        name: FanchmWrt-JDCloud-RE-SP-01B
-        path: openwrt/bin/targets/*/*/*.bin
+        name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: openwrt/bin
+
+    - name: Organize files
+      id: organize
+      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      run: |
+        cd openwrt/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware directory
+      uses: actions/upload-artifact@main
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        path: ${{ env.FIRMWARE }}
+
+    - name: Generate release tag
+      id: tag
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      run: |
+        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
+        touch release.txt
+        [ ${UPLOAD_GOFILE} = true && ${{ steps.gofile.outputs.url }} ] && echo "🔗 [GoFile](${{ steps.gofile.outputs.url }})" >> release.txt
+        echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Upload firmware to release
+      uses: softprops/action-gh-release@master
+      if: steps.tag.outputs.status == 'success' && !cancelled()
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag.outputs.release_tag }}
+        body_path: release.txt
+        files: ${{ env.FIRMWARE }}/*
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+        retain_days: 0
+        keep_minimum_runs: 2
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
+      with:
+        keep_latest: 3
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
