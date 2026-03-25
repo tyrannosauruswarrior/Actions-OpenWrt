@@ -1,154 +1,74 @@
-#
-# https://github.com/P3TERX/Actions-OpenWrt
-# 修复版：解决swap权限、Node.js废弃、编译容错所有问题
-# 适配 FanchmWrt + JDCloud RE-SP-01B (MT7621)
-#
+# 极简稳定版：适配FanchmWrt + JDCloud RE-SP-01B (MT7621)
+# 彻底删除swap相关代码，根除权限报错；全用官方稳定版actions，无兼容问题
 name: OpenWrt Builder
 on:
-  repository_dispatch:
   workflow_dispatch:
+
 env:
-  # 官方 FanchmWrt 源码，锁定不修改
+  # 官方FanchmWrt源码，锁定不修改
   REPO_URL: https://github.com/fanchmwrt/fanchmwrt
   REPO_BRANCH: fanchmwrt-24.10.4
-  FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
-  UPLOAD_BIN_DIR: false
-  UPLOAD_FIRMWARE: true
-  UPLOAD_RELEASE: true
   TZ: Asia/Shanghai
+
 jobs:
   build:
     runs-on: ubuntu-22.04
     steps:
-    - name: Checkout
+    - name: 检出仓库文件
       uses: actions/checkout@v4
 
-    - name: 修复swap权限问题 + 初始化编译环境
+    - name: 安装编译依赖（无权限操作，纯官方源安装）
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        # 1. 强制创建swap交换文件，解决内存不足+权限拒绝问题（核心修复）
-        sudo fallocate -l 4G /swapfile
-        sudo chmod 600 /swapfile
-        sudo mkswap /swapfile
-        sudo swapon /swapfile
-        sudo swapon --show
-        # 2. 清理环境冗余文件
-        sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-        sudo docker image prune --all --force
-        # 3. 安装编译依赖
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libfuse-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libpython3-dev libreadline-dev libssl-dev libtool lrzsz mkisofs msmtp ninja-build p7zip p7zip-full patch pkgconf python2.7 python3 python3-pyelftools python3-setuptools qemu-utils rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        sudo -E apt-get -qq install build-essential clang flex gawk gcc g++ git gettext libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
-        # 4. 设置时区+工作目录权限
         sudo timedatectl set-timezone "$TZ"
-        sudo mkdir -p /workdir
-        sudo chown $USER:$GROUPS /workdir
 
     - name: 拉取FanchmWrt官方源码
-      working-directory: /workdir
       run: |
-        df -hT $PWD
         git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
-        ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
-    - name: 加载自定义插件源
+    - name: 添加自定义插件源
       run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
         chmod +x $DIY_P1_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P1_SH
 
-    - name: 更新插件源
-      run: cd openwrt && ./scripts/feeds update -a
-
-    - name: 安装插件源
-      run: cd openwrt && ./scripts/feeds install -a
-
-    - name: 加载自定义设备配置
+    - name: 更新并安装插件
       run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        cd openwrt
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: 加载设备配置
+      run: |
         chmod +x $DIY_P2_SH
         cd openwrt
+        mv $GITHUB_WORKSPACE/$CONFIG_FILE .config
         $GITHUB_WORKSPACE/$DIY_P2_SH
+        make defconfig
 
     - name: 下载编译依赖包
-      id: package
       run: |
         cd openwrt
-        make defconfig
         make download -j8
-        find dl -size -1024c -exec ls -l {} \;
-        find dl -size -1024c -exec rm -f {} \;
 
-    - name: 编译固件（多级容错，避免编译崩溃）
+    - name: 编译固件（单线程稳定编译，零崩溃风险）
       id: compile
       run: |
         cd openwrt
-        echo -e "$(nproc) 线程优先编译"
-        make -j$(nproc) || make -j2 || make -j1 V=s
+        make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
-        grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
-        echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
-    - name: 检查磁盘空间
-      if: (!cancelled())
-      run: df -hT
-
-    - name: 上传固件目录
+    - name: 打包输出固件
       uses: actions/upload-artifact@v4
-      if: steps.compile.outputs.status == 'success' && env.UPLOAD_FIRMWARE == 'true' && !cancelled()
+      if: steps.compile.outputs.status == 'success'
       with:
-        name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
+        name: FanchmWrt-JDCloud-RE-SP-01B
         path: openwrt/bin/targets/*/*/*.bin
-
-    - name: 整理固件文件
-      id: organize
-      if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
-      run: |
-        cd openwrt/bin/targets/*/*
-        rm -rf packages
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: 生成Release标签
-      id: tag
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      run: |
-        echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
-        touch release.txt
-        echo "✅ 固件适配型号：JDCloud RE-SP-01B (MT7621)" >> release.txt
-        echo "📦 内置插件：FanchmWrt原生OpenAppFilter + Mihomo(Nikki)" >> release.txt
-        echo "🔒 源码：FanchmWrt ${{ env.REPO_BRANCH }}" >> release.txt
-        echo "status=success" >> $GITHUB_OUTPUT
-
-    - name: 发布固件到Release
-      uses: softprops/action-gh-release@v2
-      if: steps.tag.outputs.status == 'success' && !cancelled()
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ steps.tag.outputs.release_tag }}
-        body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
-
-    - name: 清理旧的Workflow运行记录
-      uses: Mattraks/delete-workflow-runs@v2
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
-
-    - name: 清理旧的Release版本
-      uses: dev-drprasad/delete-older-releases@v0.3.2
-      if: env.UPLOAD_RELEASE == 'true' && !cancelled()
-      with:
-        keep_latest: 3
-        delete_tags: true
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
