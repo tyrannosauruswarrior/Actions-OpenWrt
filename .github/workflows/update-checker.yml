@@ -1,3 +1,4 @@
+
 #
 # https://github.com/P3TERX/Actions-OpenWrt
 #
@@ -13,8 +14,8 @@
 name: Update Checker
 
 env:
-  REPO_URL: https://github.com/coolsnowwolf/lede
-  REPO_BRANCH: master
+  REPO_URL: https://github.com/fanchmwrt/fanchmwrt
+  REPO_BRANCH: fanchmwrt-24.10.4
 
 on:
   workflow_dispatch:
