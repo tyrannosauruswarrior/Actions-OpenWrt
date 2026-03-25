@@ -1,16 +1,13 @@
-# 极简稳定版：适配FanchmWrt + JDCloud RE-SP-01B (MT7621)
-# 彻底删除swap相关代码，根除权限报错；全用官方稳定版actions，无兼容问题
-name: OpenWrt Builder
+name: FanchmWrt Builder
 on:
   workflow_dispatch:
 
 env:
-  # 官方FanchmWrt源码，锁定不修改
+  # 强制启用Node.js 24，彻底解决废弃警告
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # 官方FanchmWrt源码，锁定稳定分支
   REPO_URL: https://github.com/fanchmwrt/fanchmwrt
   REPO_BRANCH: fanchmwrt-24.10.4
-  CONFIG_FILE: .config
-  DIY_P1_SH: diy-part1.sh
-  DIY_P2_SH: diy-part2.sh
   TZ: Asia/Shanghai
 
 jobs:
@@ -20,53 +17,86 @@ jobs:
     - name: 检出仓库文件
       uses: actions/checkout@v4
 
-    - name: 安装编译依赖（无权限操作，纯官方源安装）
+    - name: 1. 安装编译依赖（官方稳定源，无权限操作）
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
+        set -euo pipefail
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install build-essential clang flex gawk gcc g++ git gettext libncurses5-dev libssl-dev python3-distutils rsync unzip zlib1g-dev file wget
+        sudo -E apt-get -qq install --no-install-recommends \
+          build-essential clang flex gawk gcc g++ git gettext \
+          libncurses5-dev libssl-dev python3-distutils rsync \
+          unzip zlib1g-dev file wget curl ca-certificates
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
+        echo "✅ 依赖安装完成"
 
-    - name: 拉取FanchmWrt官方源码
+    - name: 2. 拉取FanchmWrt官方源码（带校验）
       run: |
-        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt
+        set -euo pipefail
+        git clone --depth 1 "$REPO_URL" -b "$REPO_BRANCH" openwrt
+        cd openwrt && git status
+        echo "✅ 源码拉取完成，分支：$REPO_BRANCH"
 
-    - name: 添加自定义插件源
+    - name: 3. 添加自定义插件源（带容错）
       run: |
-        chmod +x $DIY_P1_SH
+        set -euo pipefail
+        chmod +x "$GITHUB_WORKSPACE/diy-part1.sh"
         cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+        # 先备份原feeds配置
+        cp feeds.conf.default feeds.conf.default.bak
+        # 执行自定义插件源添加
+        "$GITHUB_WORKSPACE/diy-part1.sh"
+        echo "✅ 插件源添加完成"
+        cat feeds.conf.default
 
-    - name: 更新并安装插件
+    - name: 4. 更新并安装插件（带重试）
       run: |
+        set -euo pipefail
         cd openwrt
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        # 重试机制，避免网络波动失败
+        ./scripts/feeds update -a || ./scripts/feeds update -a
+        ./scripts/feeds install -a || ./scripts/feeds install -a
+        echo "✅ 插件安装完成"
 
-    - name: 加载设备配置
+    - name: 5. 加载设备配置与自定义修改（带严格校验）
       run: |
-        chmod +x $DIY_P2_SH
+        set -euo pipefail
+        chmod +x "$GITHUB_WORKSPACE/diy-part2.sh"
         cd openwrt
-        mv $GITHUB_WORKSPACE/$CONFIG_FILE .config
-        $GITHUB_WORKSPACE/$DIY_P2_SH
+        # 校验配置文件存在
+        if [ -f "$GITHUB_WORKSPACE/.config" ]; then
+          cp "$GITHUB_WORKSPACE/.config" .config
+          echo "✅ 配置文件加载完成"
+        else
+          echo "❌ 错误：.config文件不存在！"
+          exit 1
+        fi
+        # 执行自定义修改
+        "$GITHUB_WORKSPACE/diy-part2.sh"
+        # 校验配置合法性
         make defconfig
+        echo "✅ 配置校验通过"
 
-    - name: 下载编译依赖包
+    - name: 6. 下载编译依赖包（带重试）
       run: |
+        set -euo pipefail
         cd openwrt
-        make download -j8
+        make download -j8 || make download -j4
+        echo "✅ 依赖包下载完成"
 
-    - name: 编译固件（单线程稳定编译，零崩溃风险）
+    - name: 7. 编译固件（单线程稳定编译，带完整日志）
       id: compile
       run: |
+        set -euo pipefail
         cd openwrt
+        echo "开始编译固件，单线程稳定模式"
         make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
+        echo "✅ 固件编译完成！"
 
-    - name: 打包输出固件
+    - name: 8. 输出固件
       uses: actions/upload-artifact@v4
       if: steps.compile.outputs.status == 'success'
       with:
